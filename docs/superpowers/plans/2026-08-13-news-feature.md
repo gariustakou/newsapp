@@ -45,8 +45,8 @@
 - Web: `InMemoryNewsLocalDataSource.kt`.
 
 **Presentation** (`.../news/presentation/`)
-- `list/NewsListUiState.kt`, `list/NewsListViewModel.kt`.
-- `detail/ArticleDetailUiState.kt`, `detail/ArticleDetailViewModel.kt`.
+- `list/NewsListContract.kt` (State/Action/Event), `list/NewsListViewModel.kt`.
+- `detail/ArticleDetailContract.kt` (State/Action), `detail/ArticleDetailViewModel.kt`.
 
 **Util** (`.../news/util/`)
 - `OpenUrl.kt` (expect) + actuals android/ios/jvm/js/wasmJs.
@@ -1367,16 +1367,16 @@ git commit -m "feat(news): NewsRepositoryImpl offline-first + pagination (testé
 ## Task 8 : Présentation — NewsListViewModel (+ detail) partagé
 
 **Files:**
-- Create: `.../news/presentation/list/NewsListUiState.kt`
+- Create: `.../news/presentation/list/NewsListContract.kt` (State + Action + Event)
 - Create: `.../news/presentation/list/NewsListViewModel.kt`
-- Create: `.../news/presentation/detail/ArticleDetailUiState.kt`
+- Create: `.../news/presentation/detail/ArticleDetailContract.kt` (State + Action)
 - Create: `.../news/presentation/detail/ArticleDetailViewModel.kt`
 - Create: `.../news/util/OpenUrl.kt` (expect) + actuals android/ios/jvm/js/wasmJs
 - Test: `commonTest/.../news/presentation/NewsListViewModelTest.kt`
 
-**Interfaces:**
+**Interfaces (pattern MVI : State / Action / Event) :**
 - Consumes: `NewsRepository` (Task 2/7).
-- Produces: `NewsListUiState`, `NewsListViewModel`, `ArticleDetailViewModel`, `expect fun openUrl(url)`.
+- Produces: `NewsListState`, `NewsListAction`, `NewsListEvent`, `NewsListViewModel` (exposant `state: StateFlow`, `events: Flow`, `onAction(action)`), `ArticleDetailState`, `ArticleDetailAction`, `ArticleDetailViewModel`, `expect fun openUrl(url)`.
 
 - [ ] **Step 1: Écrire les tests du ViewModel (avec faux repository)**
 
@@ -1420,32 +1420,47 @@ class NewsListViewModelTest {
         assertEquals(1, vm.state.value.articles.size)
     }
 
+    // Toute intention passe par onAction(...) : ici la pagination.
     @Test
-    fun onScrolledToEnd_pagine() = runTest {
+    fun action_scrolledToEnd_pagine() = runTest {
         val vm = NewsListViewModel(FakeRepo())
         advanceUntilIdle()
-        vm.onScrolledToEnd()
+        vm.onAction(NewsListAction.ScrolledToEnd)
         advanceUntilIdle()
         assertEquals(2, vm.state.value.articles.size)
     }
+
+    // OpenArticle doit émettre un EVENT one-shot de navigation (pas un changement d'état).
+    @Test
+    fun action_openArticle_emet_event_navigation() = runTest {
+        val vm = NewsListViewModel(FakeRepo())
+        advanceUntilIdle()
+        val received = mutableListOf<NewsListEvent>()
+        val job = launch { vm.events.collect { received.add(it) } }
+        vm.onAction(NewsListAction.OpenArticle(article("1")))
+        advanceUntilIdle()
+        assertTrue(received.any { it is NewsListEvent.NavigateToDetail })
+        job.cancel()
+    }
 }
 ```
+> Ajouter l'import `import com.ggdevhub.newsapp.news.presentation.list.*` (State/Action/Event) en tête du test.
 
 - [ ] **Step 2: Lancer (échec attendu)**
 
 Run: `./gradlew :sharedLogic:jvmTest --tests "*NewsListViewModelTest*"`
 Expected: FAIL.
 
-- [ ] **Step 3: Créer l'état UI**
+- [ ] **Step 3: Créer le contrat MVI (State / Action / Event)**
 
-`presentation/list/NewsListUiState.kt` :
+`presentation/list/NewsListContract.kt` :
 ```kotlin
 package com.ggdevhub.newsapp.news.presentation.list
 
 import com.ggdevhub.newsapp.news.domain.model.*
 
-/** État observable de l'écran liste. L'UI (Compose/SwiftUI) le rend tel quel. */
-data class NewsListUiState(
+/** STATE — snapshot immuable de l'écran liste. L'UI (Compose/SwiftUI) le rend tel quel. */
+data class NewsListState(
     val activeFilter: NewsFilter = NewsFilter.TOP,
     val language: NewsLanguage = NewsLanguage.FR,
     val country: String? = "CM",
@@ -1458,6 +1473,22 @@ data class NewsListUiState(
     val availableFilters: List<NewsFilter> = NewsFilter.entries,
     val availableLanguages: List<NewsLanguage> = NewsLanguage.entries,
 )
+
+/** ACTION — toute intention utilisateur. Un seul point d'entrée : onAction(action). */
+sealed interface NewsListAction {
+    data class SelectFilter(val filter: NewsFilter) : NewsListAction
+    data class SelectLanguage(val language: NewsLanguage) : NewsListAction
+    data object Refresh : NewsListAction            // pull-to-refresh
+    data object ScrolledToEnd : NewsListAction      // infinite scroll
+    data class OpenArticle(val article: Article) : NewsListAction
+    data object Retry : NewsListAction
+}
+
+/** EVENT — effet one-shot (navigation, erreur), consommé une seule fois par le Root. */
+sealed interface NewsListEvent {
+    data class NavigateToDetail(val articleId: String) : NewsListEvent
+    data class ShowError(val error: DataError) : NewsListEvent
+}
 ```
 
 - [ ] **Step 4: Créer le ViewModel liste**
@@ -1470,22 +1501,46 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.ggdevhub.newsapp.news.domain.model.*
 import com.ggdevhub.newsapp.news.domain.repository.NewsRepository
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
 /**
- * ViewModel PARTAGÉ (multiplateforme). Consommé par Android (Compose natif),
- * Desktop/Web (Compose partagé) et iOS (SwiftUI observe `state`).
+ * ViewModel PARTAGÉ (MVI). Consommé par Android (Compose natif), Desktop/Web (Compose partagé)
+ * et iOS (SwiftUI). L'UI lit `state`, observe `events`, et envoie tout via `onAction(action)`.
  */
 class NewsListViewModel(private val repo: NewsRepository) : ViewModel() {
 
-    private val _state = MutableStateFlow(NewsListUiState())
-    val state: StateFlow<NewsListUiState> = _state.asStateFlow()
+    private val _state = MutableStateFlow(NewsListState())
+    val state: StateFlow<NewsListState> = _state.asStateFlow()
+
+    // Canal d'événements one-shot (navigation, erreur). receiveAsFlow = chaque event consommé une fois.
+    private val _events = Channel<NewsListEvent>(Channel.BUFFERED)
+    val events = _events.receiveAsFlow()
 
     // Collecte du cache (source de vérité) pour le filtre courant.
     private var observeJob: kotlinx.coroutines.Job? = null
 
     init { selectAndLoad(_state.value.activeFilter) }
+
+    /** POINT D'ENTRÉE UNIQUE : toutes les intentions de l'UI arrivent ici. */
+    fun onAction(action: NewsListAction) {
+        when (action) {
+            is NewsListAction.SelectFilter -> {
+                _state.update { it.copy(activeFilter = action.filter) }
+                selectAndLoad(action.filter)
+            }
+            is NewsListAction.SelectLanguage -> {
+                _state.update { it.copy(language = action.language) }
+                selectAndLoad(_state.value.activeFilter)
+            }
+            NewsListAction.Refresh -> refresh()
+            NewsListAction.ScrolledToEnd -> loadNextPage()
+            is NewsListAction.OpenArticle ->
+                viewModelScope.launch { _events.send(NewsListEvent.NavigateToDetail(action.article.id)) }
+            NewsListAction.Retry -> selectAndLoad(_state.value.activeFilter)
+        }
+    }
 
     private fun selectAndLoad(filter: NewsFilter) {
         val s = _state.value
@@ -1496,25 +1551,17 @@ class NewsListViewModel(private val repo: NewsRepository) : ViewModel() {
                 _state.update { it.copy(articles = list) }
             }
         }
-        // 2) On déclenche un refresh réseau (page 1).
+        // 2) On déclenche un refresh réseau (page 1) ; une erreur devient aussi un Event.
         viewModelScope.launch {
             _state.update { it.copy(isLoading = true, error = null, endReached = false) }
             val res = repo.refresh(filter, s.language, s.country)
-            _state.update { it.copy(isLoading = false, error = (res as? Result.Error)?.error) }
+            val err = (res as? Result.Error)?.error
+            _state.update { it.copy(isLoading = false, error = err) }
+            if (err != null) _events.send(NewsListEvent.ShowError(err))
         }
     }
 
-    fun onFilterSelected(filter: NewsFilter) {
-        _state.update { it.copy(activeFilter = filter) }
-        selectAndLoad(filter)
-    }
-
-    fun onLanguageSelected(language: NewsLanguage) {
-        _state.update { it.copy(language = language) }
-        selectAndLoad(_state.value.activeFilter)
-    }
-
-    fun onRefresh() {
+    private fun refresh() {
         val s = _state.value
         viewModelScope.launch {
             _state.update { it.copy(isRefreshing = true, error = null) }
@@ -1523,7 +1570,7 @@ class NewsListViewModel(private val repo: NewsRepository) : ViewModel() {
         }
     }
 
-    fun onScrolledToEnd() {
+    private fun loadNextPage() {
         val s = _state.value
         if (s.isPaginating || s.endReached) return  // évite les appels multiples
         viewModelScope.launch {
@@ -1538,8 +1585,6 @@ class NewsListViewModel(private val repo: NewsRepository) : ViewModel() {
             }
         }
     }
-
-    fun onRetry() = selectAndLoad(_state.value.activeFilter)
 }
 ```
 
@@ -1550,13 +1595,20 @@ Expected: PASS.
 
 - [ ] **Step 6: Créer le detail ViewModel + openUrl (expect/actual)**
 
-`presentation/detail/ArticleDetailUiState.kt` :
+`presentation/detail/ArticleDetailContract.kt` :
 ```kotlin
 package com.ggdevhub.newsapp.news.presentation.detail
 
 import com.ggdevhub.newsapp.news.domain.model.Article
 
-data class ArticleDetailUiState(val article: Article? = null, val notFound: Boolean = false)
+/** STATE du détail. */
+data class ArticleDetailState(val article: Article? = null, val notFound: Boolean = false)
+
+/** ACTION du détail (un seul point d'entrée onAction). */
+sealed interface ArticleDetailAction {
+    data class Load(val id: String) : ArticleDetailAction
+    data object OpenLink : ArticleDetailAction     // « Lire l'article » → openUrl
+}
 ```
 `presentation/detail/ArticleDetailViewModel.kt` :
 ```kotlin
@@ -1569,18 +1621,25 @@ import com.ggdevhub.newsapp.news.util.openUrl
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 
-/** Charge un article par id et gère l'ouverture du lien externe. */
+/** Charge un article par id et gère l'ouverture du lien externe (MVI : onAction). */
 class ArticleDetailViewModel(private val repo: NewsRepository) : ViewModel() {
-    private val _state = MutableStateFlow(ArticleDetailUiState())
-    val state: StateFlow<ArticleDetailUiState> = _state.asStateFlow()
+    private val _state = MutableStateFlow(ArticleDetailState())
+    val state: StateFlow<ArticleDetailState> = _state.asStateFlow()
 
-    fun load(id: String) = viewModelScope.launch {
-        val a = repo.getArticle(id)
-        _state.value = ArticleDetailUiState(article = a, notFound = a == null)
+    /** POINT D'ENTRÉE UNIQUE. */
+    fun onAction(action: ArticleDetailAction) {
+        when (action) {
+            is ArticleDetailAction.Load -> load(action.id)
+            ArticleDetailAction.OpenLink -> _state.value.article?.url?.let { openUrl(it) }
+        }
     }
 
-    /** Ouvre l'article complet dans le navigateur de la plateforme. */
-    fun openArticle() { _state.value.article?.url?.let { openUrl(it) } }
+    private fun load(id: String) {
+        viewModelScope.launch {
+            val a = repo.getArticle(id)
+            _state.value = ArticleDetailState(article = a, notFound = a == null)
+        }
+    }
 }
 ```
 `util/OpenUrl.kt` (commonMain, expect) :
@@ -1861,7 +1920,7 @@ git commit -m "feat(news): DI Koin (modules réseau/news + data plateforme) + in
 - Modify: `sharedUI/src/commonMain/.../App.kt` (afficher NewsRootScreen)
 
 **Interfaces:**
-- Consumes: `NewsListViewModel`, `ArticleDetailViewModel`, `NewsListUiState`, `Article`, `NewsFilter` (sharedLogic).
+- Consumes: `NewsListViewModel` (`state`/`events`/`onAction`), `NewsListState`/`NewsListAction`/`NewsListEvent`, `ArticleDetailViewModel`/`ArticleDetailAction`, `Article`, `NewsFilter` (sharedLogic).
 - Produces: `NewsRootScreen()` composable racine.
 
 - [ ] **Step 1: Chips de catégories**
@@ -1947,32 +2006,53 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import com.ggdevhub.newsapp.news.domain.model.Article
+import com.ggdevhub.newsapp.news.presentation.list.NewsListAction
+import com.ggdevhub.newsapp.news.presentation.list.NewsListEvent
 import com.ggdevhub.newsapp.news.presentation.list.NewsListViewModel
 import org.koin.compose.viewmodel.koinViewModel
 
 /**
- * Écran liste PARTAGÉ (Desktop + Web). Réutilise le ViewModel partagé via Koin.
- * @param onOpenArticle callback pour naviguer vers le détail.
+ * Écran liste PARTAGÉ (Desktop + Web), en MVI :
+ * lit `state`, envoie tout via `vm.onAction(...)`, et observe `vm.events` pour naviguer.
+ * @param onOpenArticle appelé quand l'Event NavigateToDetail arrive (le Root/racine navigue).
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun NewsListScreen(onOpenArticle: (Article) -> Unit, vm: NewsListViewModel = koinViewModel()) {
+fun NewsListScreen(onOpenArticle: (String) -> Unit, vm: NewsListViewModel = koinViewModel()) {
     val state by vm.state.collectAsState()
     val listState = rememberLazyListState()
 
-    // Détecte l'arrivée en bas de liste → déclenche la pagination.
+    // Observe les événements one-shot (navigation). Collectés une seule fois → pas de re-déclenchement.
+    LaunchedEffect(Unit) {
+        vm.events.collect { event ->
+            when (event) {
+                is NewsListEvent.NavigateToDetail -> onOpenArticle(event.articleId)
+                is NewsListEvent.ShowError -> Unit // (afficher un snackbar ici si souhaité)
+            }
+        }
+    }
+
+    // Détecte l'arrivée en bas de liste → envoie une Action de pagination.
     val atEnd by remember {
         derivedStateOf {
             val last = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
             last >= state.articles.size - 3 && state.articles.isNotEmpty()
         }
     }
-    LaunchedEffect(atEnd) { if (atEnd) vm.onScrolledToEnd() }
+    LaunchedEffect(atEnd) { if (atEnd) vm.onAction(NewsListAction.ScrolledToEnd) }
 
     Column(Modifier.fillMaxSize()) {
-        CategoryChips(state.availableFilters, state.activeFilter, vm::onFilterSelected, Modifier.padding(vertical = 8.dp))
-        PullToRefreshBox(isRefreshing = state.isRefreshing, onRefresh = vm::onRefresh, modifier = Modifier.weight(1f)) {
+        CategoryChips(
+            filters = state.availableFilters,
+            active = state.activeFilter,
+            onSelect = { vm.onAction(NewsListAction.SelectFilter(it)) },
+            modifier = Modifier.padding(vertical = 8.dp),
+        )
+        PullToRefreshBox(
+            isRefreshing = state.isRefreshing,
+            onRefresh = { vm.onAction(NewsListAction.Refresh) },
+            modifier = Modifier.weight(1f),
+        ) {
             when {
                 state.isLoading && state.articles.isEmpty() ->
                     Box(Modifier.fillMaxSize(), Alignment.Center) { CircularProgressIndicator() }
@@ -1980,7 +2060,9 @@ fun NewsListScreen(onOpenArticle: (Article) -> Unit, vm: NewsListViewModel = koi
                     Box(Modifier.fillMaxSize(), Alignment.Center) { Text("Aucun article") }
                 else -> LazyColumn(state = listState, contentPadding = PaddingValues(12.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    items(state.articles, key = { it.id }) { a -> ArticleCard(a, { onOpenArticle(a) }) }
+                    items(state.articles, key = { it.id }) { a ->
+                        ArticleCard(a, onClick = { vm.onAction(NewsListAction.OpenArticle(a)) })
+                    }
                     if (state.isPaginating) item {
                         Box(Modifier.fillMaxWidth().padding(16.dp), Alignment.Center) { CircularProgressIndicator() }
                     }
@@ -2006,13 +2088,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
 import coil3.compose.AsyncImage
+import com.ggdevhub.newsapp.news.presentation.detail.ArticleDetailAction
 import com.ggdevhub.newsapp.news.presentation.detail.ArticleDetailViewModel
 import org.koin.compose.viewmodel.koinViewModel
 
-/** Détail natif : image + titre + extrait + bouton "Lire l'article" (lien externe). */
+/** Détail natif (MVI) : image + titre + extrait + bouton "Lire l'article" (lien externe). */
 @Composable
 fun ArticleDetailScreen(articleId: String, vm: ArticleDetailViewModel = koinViewModel()) {
-    LaunchedEffect(articleId) { vm.load(articleId) }
+    // Charge l'article via une Action au (re)démarrage de l'écran.
+    LaunchedEffect(articleId) { vm.onAction(ArticleDetailAction.Load(articleId)) }
     val state by vm.state.collectAsState()
     val a = state.article
 
@@ -2025,7 +2109,8 @@ fun ArticleDetailScreen(articleId: String, vm: ArticleDetailViewModel = koinView
         Text(a.title, style = MaterialTheme.typography.headlineSmall)
         a.sourceName?.let { Text(it, style = MaterialTheme.typography.labelMedium) }
         a.description?.let { Text(it, style = MaterialTheme.typography.bodyLarge) }
-        Button(onClick = vm::openArticle) { Text("Lire l'article") }
+        // « Lire l'article » = une Action ; le ViewModel appelle openUrl().
+        Button(onClick = { vm.onAction(ArticleDetailAction.OpenLink) }) { Text("Lire l'article") }
     }
 }
 ```
@@ -2038,21 +2123,21 @@ package com.ggdevhub.newsapp.news.ui
 
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import com.ggdevhub.newsapp.news.domain.model.Article
 
 /**
  * Navigation minimale à état (v1) : liste ↔ détail, sans lib de nav.
+ * Le "Root" reçoit l'id de l'article via l'Event NavigateToDetail émis par le ViewModel.
  * On branchera navigation-compose plus tard si besoin.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun NewsRootScreen() {
-    var selected by remember { mutableStateOf<Article?>(null) }
-    val current = selected
-    Scaffold(topBar = { TopAppBar(title = { Text(if (current == null) "Actualités" else "Article") }) }) { padding ->
+    var selectedId by remember { mutableStateOf<String?>(null) }
+    val currentId = selectedId
+    Scaffold(topBar = { TopAppBar(title = { Text(if (currentId == null) "Actualités" else "Article") }) }) { padding ->
         androidx.compose.foundation.layout.Box(androidx.compose.ui.Modifier.padding(padding)) {
-            if (current == null) NewsListScreen(onOpenArticle = { selected = it })
-            else ArticleDetailScreen(articleId = current.id)
+            if (currentId == null) NewsListScreen(onOpenArticle = { selectedId = it })
+            else ArticleDetailScreen(articleId = currentId)
         }
     }
 }
@@ -2153,7 +2238,7 @@ git commit -m "feat(news): UI Android native + démarrage Koin (Android/Desktop/
 
 - **Couverture spec** : deps/infra (T1) · domaine+Result/DataError (T2) · Currents DTO/mapper (T3) · mapping filtre+fallback (T4) · HttpClient/Api (T5) · Room+InMemory (T6) · repository offline-first+pagination (T7) · ViewModel partagé+openUrl (T8) · DI Koin+initKoin (T9) · UI partagée Desktop/Web (T10) · UI Android+démarrage apps (T11). iOS SwiftUI, recherche, favoris, WebView = **v2** (hors plan, conforme à la spec).
 - **Placeholders** : la seule valeur à récupérer est la **version KSP** (T1 Step 1) — instruction actionnable (lien releases), pas un TODO de logique.
-- **Cohérence des types** : `NewsRepository`, `NewsLocalDataSource`, `NewsRemoteDataSource`, `NewsRequest`, `buildRequest/fallbackCountries`, `toArticle/toEntity`, `NewsListUiState`, `openUrl`, `initKoin/appModules/platformDataModule` cohérents d'une tâche à l'autre.
+- **Cohérence des types** : `NewsRepository`, `NewsLocalDataSource`, `NewsRemoteDataSource`, `NewsRequest`, `buildRequest/fallbackCountries`, `toArticle/toEntity`, MVI `NewsListState`/`NewsListAction`/`NewsListEvent` + `onAction`/`events`, `ArticleDetailState`/`ArticleDetailAction`, `openUrl`, `initKoin/appModules/platformDataModule` cohérents d'une tâche à l'autre.
 - **Note** : `InMemoryNewsLocalDataSource` placée en `commonMain` (et non `webMain`) pour être testable et réutilisable ; seule la SÉLECTION Room/InMemory diffère par plateforme (via `platformDataModule`).
 
 ## Risques connus (rappel spec)

@@ -67,8 +67,8 @@ sharedLogic/src/commonMain/kotlin/com/ggdevhub/newsapp/news/
 │   ├── NewsRepositoryImpl
 │   └── mapper/        DTO ↔ domain, Entity ↔ domain
 ├── presentation/
-│   ├── list/          NewsListViewModel, NewsListUiState, NewsListEvent
-│   └── detail/        ArticleDetailViewModel, ArticleDetailUiState
+│   ├── list/          NewsListViewModel + NewsListContract (State/Action/Event)
+│   └── detail/        ArticleDetailViewModel + ArticleDetailContract (State/Action)
 ├── di/                networkModule, databaseModule, newsModule (Koin)
 └── util/              Result<D,E>, Paginator, openUrl (expect/actual)
 
@@ -242,34 +242,53 @@ Impl : `RoomNewsLocalDataSource` (nonWeb) / `InMemoryNewsLocalDataSource` (web).
 
 ---
 
-## 9. Présentation (`news/presentation`) — ViewModel partagé
+## 9. Présentation (`news/presentation`) — ViewModel partagé (MVI : State / Action / Event)
+
+On applique le pattern **MVI / UDF** : l'UI n'expose qu'un **`State`** immuable, envoie toutes les intentions via **un seul `onAction(Action)`**, et reçoit les effets one-shot (navigation, ouverture de lien, erreur) via un flux d'**`Event`**. Cohérent avec `ido_app`/Chirp et idéal pour le pont iOS SwiftUI.
 
 ```kotlin
-data class NewsListUiState(
+// STATE — snapshot immuable de l'écran liste
+data class NewsListState(
     val activeFilter: NewsFilter = NewsFilter.TOP,
     val language: NewsLanguage = NewsLanguage.FR,
     val country: String? = "CM",
     val articles: List<Article> = emptyList(),
-    val isLoading: Boolean = false,        // refresh page 1
+    val isLoading: Boolean = false,        // refresh page 1 / changement de filtre
     val isPaginating: Boolean = false,     // loader du bas
     val isRefreshing: Boolean = false,     // pull-to-refresh
     val endReached: Boolean = false,
     val error: DataError? = null,
     val availableFilters: List<NewsFilter> = NewsFilter.entries,
+    val availableLanguages: List<NewsLanguage> = NewsLanguage.entries,
 )
 
+// ACTION — toute intention utilisateur (un seul point d'entrée onAction)
+sealed interface NewsListAction {
+    data class SelectFilter(val filter: NewsFilter) : NewsListAction
+    data class SelectLanguage(val language: NewsLanguage) : NewsListAction
+    data object Refresh : NewsListAction            // pull-to-refresh
+    data object ScrolledToEnd : NewsListAction      // infinite scroll
+    data class OpenArticle(val article: Article) : NewsListAction
+    data object Retry : NewsListAction
+}
+
+// EVENT — effets one-shot, consommés une seule fois par le Root
+sealed interface NewsListEvent {
+    data class NavigateToDetail(val articleId: String) : NewsListEvent
+    data class ShowError(val error: DataError) : NewsListEvent
+}
+
 class NewsListViewModel(private val repo: NewsRepository) : ViewModel() {
-    val state: StateFlow<NewsListUiState>
-    fun onFilterSelected(f: NewsFilter)   // change de chip → observe + refresh
-    fun onLanguageSelected(l: NewsLanguage)
-    fun onRefresh()                        // pull-to-refresh
-    fun onScrolledToEnd()                  // infinite scroll → loadNextPage
-    fun onRetry()
+    val state: StateFlow<NewsListState>           // combine repo.observeArticles(...) + flags UI (stateIn)
+    val events: Flow<NewsListEvent>               // Channel(...).receiveAsFlow()
+    fun onAction(action: NewsListAction)          // POINT D'ENTRÉE UNIQUE
 }
 ```
-- `state` combine `repo.observeArticles(...)` (Flow) + flags UI, via `stateIn(viewModelScope, WhileSubscribed, initial)`.
-- `ArticleDetailViewModel` : charge un `Article` par id + action « ouvrir le lien » (`openUrl`).
-- **Ouverture lien externe** : `expect fun openUrl(url: String)` → actual Android (Custom Tabs/Intent), iOS (UIApplication), Desktop (Desktop.browse), Web (window.open). Placé dans `util/`.
+- `state` combine `repo.observeArticles(...)` (Flow) + les flags UI, via `stateIn(viewModelScope, WhileSubscribed, initial)`.
+- Les effets one-shot passent par `events` (ex. `OpenArticle` → `NavigateToDetail`), jamais par l'état → pas de re-déclenchement à la recomposition.
+- **Écran détail** : `ArticleDetailState(article, notFound)` + `sealed interface ArticleDetailAction { data object OpenLink; data class Load(id) }`. `OpenLink` appelle `openUrl(article.url)`.
+- **Ouverture lien externe** : `expect fun openUrl(url: String)` → actual Android (Intent), iOS (UIApplication), Desktop (Desktop.browse), Web (window.open). Placé dans `util/`.
+- **Côté UI** : `Screen(state, onAction)` **stateless** (testable/preview) ; un `Root` collecte `state` et **observe `events`** pour naviguer. iOS SwiftUI fait de même (observe `state`, dispatche des `Action`, réagit aux `events`).
 
 ---
 

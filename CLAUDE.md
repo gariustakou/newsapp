@@ -111,13 +111,16 @@ Room does **not** compile for `js`/`wasmJs`. Room is isolated behind a `NewsLoca
 
 ---
 
-## Architecture — shared ViewModel + typed Result + offline-first repository
+## Architecture — MVI (State / Action / Event) + typed Result + offline-first repository
 
-This project uses a lightweight **unidirectional** pattern (not a starter's MVI base class):
+This project uses **MVI / Unidirectional Data Flow**, the **same pattern as the maintainer's own reference projects** `ido_app` and `neotrackapp` (verified in their code: per-feature `XxxState.kt` / `XxxAction.kt` / `XxxEvent.kt` files with a single `onAction(action)` entry point). We implement it directly — **no external MVI base class** (this repo has no DevAtrii starter). Follow this pattern for every screen.
 
-- **Shared multiplatform ViewModel** (`org.jetbrains.androidx.lifecycle:lifecycle-viewmodel`) in `news/presentation/`. It exposes an immutable **`StateFlow<XxxUiState>`** and intent functions (`onFilterSelected`, `onRefresh`, `onScrolledToEnd`, …). The **same** ViewModel is consumed by Android (Compose native), Desktop/Web (shared Compose via `koinViewModel()`), and iOS (SwiftUI observes its `StateFlow`).
-- **State is an immutable snapshot** (`data class …UiState`); only the ViewModel mutates it via `_state.update { }`. Keep transient view state (dialog/dropdown visibility, focus, animation) local to the composable, not in `UiState`.
-- **Typed errors.** Fallible operations return `Result<D, DataError>` (custom sealed types in `news/domain/model`), never exceptions as control flow. The presentation layer maps errors to UI messages.
+- **State** — an immutable `data class …State` snapshot the UI renders. Only the ViewModel mutates it via `_state.update { }`. Keep transient view state (dialog/dropdown visibility, focus, animation) local to the composable, **never** in `State`.
+- **Action** — a `sealed interface …Action` of every user intent. The UI sends **all** intents through **one** entry point: `fun onAction(action)`. No business logic in composables.
+- **Event** — a `sealed interface …Event` of one-shot effects (navigation, snackbar, open-link), emitted via a `Channel(...).receiveAsFlow()` and observed once by the `Root`/screen. Do **not** model one-shot effects as state (avoids re-triggering on recomposition).
+- **Shared multiplatform ViewModel** (`org.jetbrains.androidx.lifecycle:lifecycle-viewmodel`) in `news/presentation/`, exposing `state: StateFlow<…State>`, `events: Flow<…Event>`, and `onAction(...)`. The **same** ViewModel is consumed by Android (native Compose), Desktop/Web (shared Compose via `koinViewModel()`), and iOS (SwiftUI observes `state`, dispatches `Action`, reacts to `events`).
+- **UI split:** a stateless `Screen(state, onAction)` (preview-able/testable) + a connected `Root` that collects `state`, observes `events`, and performs navigation. ViewModels never navigate directly — they emit an `Event`.
+- **Typed errors.** Fallible operations return `Result<D, DataError>` (custom sealed types in `news/domain/model`), never exceptions as control flow. The presentation layer maps errors to UI messages / `ShowError` events.
 - **Domain models never leak infrastructure.** DTOs (remote), Room entities (local), and domain `Article` are distinct; map at each boundary with extension-function mappers. UI only ever sees domain models.
 - **Repository is the source of truth (offline-first).** `NewsRepositoryImpl` combines a remote source (Currents/Ktor) and a local source (Room/in-memory), exposes a `Flow`, and handles pagination + refresh + a country fallback cascade. Side effects live in the ViewModel/repository, never in composables or mappers.
 
@@ -186,7 +189,7 @@ Always use the Gradle wrapper (`./gradlew`).
 ## Definition of done — checklist
 
 - [ ] Mono-module respected; Clean Architecture by packages (`presentation → domain ← data`); no duplicated utilities.
-- [ ] Shared multiplatform ViewModel with immutable `StateFlow<UiState>` + intent functions; no business logic in composables; no transient UI state in `UiState`.
+- [ ] MVI respected: shared ViewModel exposing `state: StateFlow<…State>` + `events: Flow<…Event>` + single `onAction(…Action)`; per-screen `XxxState`/`XxxAction`/`XxxEvent`; no business logic in composables; no transient UI state in `State`; ViewModels emit `Event`s instead of navigating.
 - [ ] Typed `Result`/`DataError`; DTO/entity/domain kept distinct with mappers; UI sees domain models only.
 - [ ] UI written **per platform** where required: Android native Compose (`androidApp`), shared Compose (`sharedUI`, Desktop+Web), SwiftUI (iOS, v2). Android does **not** use `sharedUI`.
 - [ ] Room only in `nonWebMain`; Web uses the in-memory `NewsLocalDataSource`. Nothing Room in `commonMain`.
